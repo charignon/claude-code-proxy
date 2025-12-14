@@ -106,6 +106,11 @@ PREFERRED_PROVIDER = os.environ.get("PREFERRED_PROVIDER", "openai").lower()
 BIG_MODEL = os.environ.get("BIG_MODEL", "gpt-4.1")
 SMALL_MODEL = os.environ.get("SMALL_MODEL", "gpt-4.1-mini")
 
+# Fix for OpenAI models that don't handle empty tool results well
+# When enabled, replaces empty content with a placeholder
+FIX_EMPTY_TOOL_RESULTS = os.environ.get("FIX_EMPTY_TOOL_RESULTS", "").lower() in ("1", "true", "yes")
+EMPTY_TOOL_RESULT_PLACEHOLDER = os.environ.get("EMPTY_TOOL_RESULT_PLACEHOLDER", "NULL")
+
 # List of OpenAI models
 # Naming convention:
 #   gpt-4o      = GPT-4 "omni" - multimodal (text, image, audio)
@@ -770,13 +775,24 @@ async def stream_direct_to_llm_proxy(litellm_request: dict, original_request, ba
     litellm_tools = litellm_request.get("tools", [])
     original_tools = original_request.tools if original_request.tools else []
 
+    # Check if this is Ollama (studio.lan) - disable streaming for tool calls
+    # Ollama has a bug where streaming tool calls are malformed (missing index field)
+    is_ollama = "11434" in base_url or "ollama" in base_url.lower()
+    has_tools = bool(litellm_tools or original_tools)
+    use_streaming = not (is_ollama and has_tools)
+
+    if is_ollama and has_tools:
+        logger.info("🔧 Ollama + tools detected: using non-streaming mode for reliable tool calls")
+
     # Build OpenAI-compatible request
     openai_request = {
         "model": litellm_request.get("model", "").replace("openai/", ""),
         "messages": litellm_request.get("messages", []),
-        "stream": True,
-        "stream_options": {"include_usage": True},  # Request usage in streaming response
+        "stream": use_streaming,
     }
+
+    if use_streaming:
+        openai_request["stream_options"] = {"include_usage": True}
 
     # Use tools from litellm_request or convert from original request
     tools_to_use = litellm_tools if litellm_tools else None
@@ -813,6 +829,66 @@ async def stream_direct_to_llm_proxy(litellm_request: dict, original_request, ba
     }
 
     url = f"{base_url.rstrip('/')}/chat/completions"
+
+    # For non-streaming mode (Ollama + tools), make a single request and convert to SSE
+    if not use_streaming:
+        async def generate_non_streaming():
+            message_id = f"msg_{uuid.uuid4().hex[:24]}"
+
+            async with httpx.AsyncClient(timeout=300.0) as client:
+                response = await client.post(url, json=openai_request, headers=headers)
+                if response.status_code != 200:
+                    raise HTTPException(status_code=response.status_code, detail=f"Ollama error: {response.text}")
+
+                result = response.json()
+
+            choice = result.get("choices", [{}])[0]
+            message = choice.get("message", {})
+            content = message.get("content", "") or ""
+            tool_calls = message.get("tool_calls", [])
+            finish_reason = choice.get("finish_reason", "end_turn")
+            usage = result.get("usage", {})
+
+            # Map finish reasons
+            if finish_reason == "tool_calls":
+                stop_reason = "tool_use"
+            elif finish_reason == "stop":
+                stop_reason = "end_turn"
+            else:
+                stop_reason = finish_reason
+
+            # Build content blocks
+            content_blocks = []
+            if content:
+                content_blocks.append({"type": "text", "text": content})
+
+            for tc in tool_calls:
+                func = tc.get("function", {})
+                try:
+                    args = json.loads(func.get("arguments", "{}"))
+                except:
+                    args = {}
+                content_blocks.append({
+                    "type": "tool_use",
+                    "id": tc.get("id", f"toolu_{uuid.uuid4().hex[:24]}"),
+                    "name": func.get("name", ""),
+                    "input": args
+                })
+
+            # Emit SSE events (Claude Code expects streaming format even for non-streaming)
+            yield f"event: message_start\ndata: {json.dumps({'type': 'message_start', 'message': {'id': message_id, 'type': 'message', 'role': 'assistant', 'model': original_request.model, 'content': [], 'stop_reason': None, 'stop_sequence': None, 'usage': {'input_tokens': usage.get('prompt_tokens', 0), 'cache_creation_input_tokens': 0, 'cache_read_input_tokens': 0, 'output_tokens': 0}}})}\n\n"
+
+            # Emit content blocks
+            for idx, block in enumerate(content_blocks):
+                yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': idx, 'content_block': block})}\n\n"
+                yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': idx})}\n\n"
+
+            # Emit message_delta with stop_reason and usage
+            yield f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': stop_reason, 'stop_sequence': None}, 'usage': {'output_tokens': usage.get('completion_tokens', 0)}})}\n\n"
+            yield f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
+            yield "data: [DONE]\n\n"
+
+        return StreamingResponse(generate_non_streaming(), media_type="text/event-stream")
 
     async def generate():
         message_id = f"msg_{uuid.uuid4().hex[:24]}"
@@ -1196,13 +1272,25 @@ async def log_requests(request: Request, call_next):
 
 # Not using validation function as we're using the environment API key
 
+def fix_empty_result(content) -> str:
+    """Replace empty content with placeholder if FIX_EMPTY_TOOL_RESULTS is enabled."""
+    if not FIX_EMPTY_TOOL_RESULTS:
+        return content
+    if content is None:
+        return EMPTY_TOOL_RESULT_PLACEHOLDER
+    if not isinstance(content, str):
+        return content  # Don't modify non-strings
+    if content == "" or content.strip() == "":
+        return EMPTY_TOOL_RESULT_PLACEHOLDER
+    return content
+
 def parse_tool_result_content(content):
     """Helper function to properly parse and normalize tool result content."""
     if content is None:
-        return "No content provided"
-        
+        return fix_empty_result("No content provided")
+
     if isinstance(content, str):
-        return content
+        return fix_empty_result(content)
         
     if isinstance(content, list):
         result = ""
@@ -1224,19 +1312,19 @@ def parse_tool_result_content(content):
                     result += str(item) + "\n"
                 except:
                     result += "Unparseable content\n"
-        return result.strip()
-        
+        return fix_empty_result(result.strip())
+
     if isinstance(content, dict):
         if content.get("type") == "text":
-            return content.get("text", "")
+            return fix_empty_result(content.get("text", ""))
         try:
-            return json.dumps(content)
+            return fix_empty_result(json.dumps(content))
         except:
-            return str(content)
-            
+            return fix_empty_result(str(content))
+
     # Fallback for any other type
     try:
-        return str(content)
+        return fix_empty_result(str(content))
     except:
         return "Unparseable content"
 
@@ -1323,7 +1411,10 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
                                         result_content = str(block.content)
                                     except:
                                         result_content = "Unparseable content"
-                            
+
+                            # Apply empty result fix
+                            result_content = fix_empty_result(result_content)
+
                             # In OpenAI format, tool results come from the user (rather than being content blocks)
                             text_content += f"Tool result for {tool_id}:\n{result_content}\n"
                 
@@ -1352,22 +1443,29 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
                                 "type": "tool_result",
                                 "tool_use_id": block.tool_use_id if hasattr(block, "tool_use_id") else ""
                             }
-                            
+
                             # Process the content field properly
                             if hasattr(block, "content"):
                                 if isinstance(block.content, str):
                                     # If it's a simple string, create a text block for it
-                                    processed_content_block["content"] = [{"type": "text", "text": block.content}]
+                                    text_val = fix_empty_result(block.content)
+                                    processed_content_block["content"] = [{"type": "text", "text": text_val}]
                                 elif isinstance(block.content, list):
-                                    # If it's already a list of blocks, keep it
-                                    processed_content_block["content"] = block.content
+                                    # If it's already a list of blocks, apply fix to text blocks
+                                    fixed_content = []
+                                    for item in block.content:
+                                        if isinstance(item, dict) and item.get("type") == "text":
+                                            fixed_content.append({"type": "text", "text": fix_empty_result(item.get("text", ""))})
+                                        else:
+                                            fixed_content.append(item)
+                                    processed_content_block["content"] = fixed_content if fixed_content else [{"type": "text", "text": fix_empty_result("")}]
                                 else:
                                     # Default fallback
-                                    processed_content_block["content"] = [{"type": "text", "text": str(block.content)}]
+                                    processed_content_block["content"] = [{"type": "text", "text": fix_empty_result(str(block.content))}]
                             else:
                                 # Default empty content
-                                processed_content_block["content"] = [{"type": "text", "text": ""}]
-                                
+                                processed_content_block["content"] = [{"type": "text", "text": fix_empty_result("")}]
+
                             processed_content.append(processed_content_block)
                 
                 messages.append({"role": msg.role, "content": processed_content})
@@ -2154,8 +2252,9 @@ async def create_message(
                 200  # Assuming success at this point
             )
 
-            # Bypass LiteLLM for llm-proxy (LiteLLM strips tools with custom api_base)
-            if OPENAI_BASE_URL and "llm-proxy" in OPENAI_BASE_URL:
+            # Bypass LiteLLM for custom base URLs (LiteLLM strips tools with custom api_base)
+            # This includes llm-proxy.lan, studio.lan (Ollama), or any other custom endpoint
+            if OPENAI_BASE_URL:
                 return await stream_direct_to_llm_proxy(litellm_request, request, OPENAI_BASE_URL, OPENAI_API_KEY)
 
             # Use LiteLLM for other providers
